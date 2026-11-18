@@ -1,0 +1,434 @@
+diff --git a/packages/pastebar-app-ui/src/pages/components/ClipboardHistory/ClipboardHistoryRow.tsx b/packages/pastebar-app-ui/src/pages/components/ClipboardHistory/ClipboardHistoryRow.tsx
+index 8715451..db04b08 100644
+--- a/packages/pastebar-app-ui/src/pages/components/ClipboardHistory/ClipboardHistoryRow.tsx
++++ b/packages/pastebar-app-ui/src/pages/components/ClipboardHistory/ClipboardHistoryRow.tsx
+@@ -440,2 +440,14 @@ export function ClipboardHistoryRowComponent({
+       {...(isSelected || isHovering ? listeners : {})}
++      onPointerDown={event => {
++        const target = event.target as Node
++        if (
++          copyIconButtonRef.current?.contains(target) ||
++          contextMenuButtonRef.current?.contains(target)
++        ) {
++          return
++        }
++        if (isSelected || isHovering) {
++          listeners?.onPointerDown?.(event)
++        }
++      }}
+     >
+diff --git a/packages/pastebar-app-ui/src/pages/main/ClipboardHistoryPage.tsx b/packages/pastebar-app-ui/src/pages/main/ClipboardHistoryPage.tsx
+index 9902919..60c3928 100644
+--- a/packages/pastebar-app-ui/src/pages/main/ClipboardHistoryPage.tsx
++++ b/packages/pastebar-app-ui/src/pages/main/ClipboardHistoryPage.tsx
+@@ -16,2 +16,3 @@ import { Portal } from '@radix-ui/react-portal'
+ import { listen } from '@tauri-apps/api/event'
++import { invoke } from '@tauri-apps/api/tauri'
+ import { MainContainer } from '~/layout/Layout'
+@@ -268,2 +269,4 @@ export default function ClipboardHistoryPage() {
+   const [activeDragId, setActiveDragId] = useState<UniqueIdentifier | null>(null)
++  const isMouseDrag = useRef(false)
++  const pendingWindowDrag = useRef<Promise<boolean> | null>(null)
+   const [brokenImageItems, setBrokenImageItems] = useState<UniqueIdentifier[]>([])
+@@ -1717,3 +1720,6 @@ export default function ClipboardHistoryPage() {
+   const pointerSensor = useSensor(PointerSensor, {
+-    activationConstraint: { tolerance: 10, delay: 300 },
++    activationConstraint: { tolerance: 10, delay: 100 },
++    onActivation: ({ event }) => {
++      isMouseDrag.current = event instanceof PointerEvent && event.pointerType === 'mouse'
++    },
+   })
+@@ -1862,2 +1868,32 @@ export default function ClipboardHistoryPage() {
+           setIsDragPinnedHistory(active.id && active.data.current?.isPinned)
++          if (isWindows && isMouseDrag.current) {
++            const request = invoke<boolean>('track_external_history_drag', {
++              historyId: getActiveIdFromPinned(active.id),
++            }).catch(error => {
++              console.error('Could not start system drag', error)
++              return false
++            })
++            pendingWindowDrag.current = request
++            // Native drag capture may consume the mouse release. Clear the
++            // in-app drag when Windows reports a release outside this window.
++            void request.then(isInternalDrop => {
++              if (pendingWindowDrag.current !== request) return
++              if (isInternalDrop) {
++                // Give WebView's normal release event time to finish the drop.
++                setTimeout(() => {
++                  if (pendingWindowDrag.current === request) {
++                    document.dispatchEvent(new PointerEvent('pointerup'))
++                  }
++                }, 32)
++              } else {
++                document.dispatchEvent(
++                  new KeyboardEvent('keydown', { code: 'Escape', key: 'Escape' })
++                )
++              }
++            })
++          }
++        }}
++        cancelDrop={async () => {
++          const request = pendingWindowDrag.current
++          return request ? !(await request) : false
+         }}
+@@ -1888,4 +1924,6 @@ export default function ClipboardHistoryPage() {
+         onDragCancel={() => {
++          pendingWindowDrag.current = null
+           setActiveDragId(null)
+           setDragOverTrashId(null)
++          setDragOverPinnedId(null)
+           setDragOverBoardId(null)
+@@ -1895,2 +1933,3 @@ export default function ClipboardHistoryPage() {
+         onDragEnd={async ({ active }) => {
++          pendingWindowDrag.current = null
+           const isPinnedItem = active?.data.current?.isPinned
+diff --git a/src-tauri/Cargo.lock b/src-tauri/Cargo.lock
+index e1a0b29..ca5e966 100644
+--- a/src-tauri/Cargo.lock
++++ b/src-tauri/Cargo.lock
+@@ -4265,2 +4265,3 @@ dependencies = [
+  "bcrypt",
++ "cc",
+  "chrono",
+diff --git a/src-tauri/Cargo.toml b/src-tauri/Cargo.toml
+index 0e97991..caf7c1a 100644
+--- a/src-tauri/Cargo.toml
++++ b/src-tauri/Cargo.toml
+@@ -13,2 +13,5 @@ features = []
+ 
++[target.'cfg(target_os = "windows")'.build-dependencies]
++cc = "1"
++
+ [target.'cfg(target_os = "windows")'.dependencies]
+diff --git a/src-tauri/build.rs b/src-tauri/build.rs
+index 795b9b7..a7b19ee 100644
+--- a/src-tauri/build.rs
++++ b/src-tauri/build.rs
+@@ -1,2 +1,13 @@
+ fn main() {
++  if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
++    println!("cargo:rerun-if-changed=src/history_drag_windows.cpp");
++    #[cfg(target_os = "windows")]
++    cc::Build::new()
++      .cpp(true)
++      .file("src/history_drag_windows.cpp")
++      .compile("history_drag");
++    println!("cargo:rustc-link-lib=ole32");
++    println!("cargo:rustc-link-lib=shell32");
++    println!("cargo:rustc-link-lib=uuid");
++  }
+   tauri_build::build()
+diff --git a/src-tauri/src/main.rs b/src-tauri/src/main.rs
+index 1640d9c..2fd2dca 100644
+--- a/src-tauri/src/main.rs
++++ b/src-tauri/src/main.rs
+@@ -33,2 +33,3 @@ mod window_ext;
+ mod clipboard;
++mod history_drag;
+ mod commands;
+@@ -1282,2 +1283,3 @@ async fn main() {
+     .invoke_handler(tauri::generate_handler![
++      history_drag::track_external_history_drag,
+       app_ready,
+diff --git a/src-tauri/src/history_drag.rs b/src-tauri/src/history_drag.rs
+new file mode 100644
+index 0000000..cbd42f6
+--- /dev/null
++++ b/src-tauri/src/history_drag.rs
+@@ -0,0 +1,72 @@
++#[cfg(target_os = "windows")]
++extern "C" {
++  fn wait_for_drag_exit(window: usize, has_payload: i32) -> i32;
++  fn drag_history_payload(window: usize, payload: *const u16, is_file: i32) -> i32;
++}
++
++/// Leave an in-window gesture with the webview. Start a Windows copy drag
++/// when the same press moves to another window.
++#[tauri::command]
++pub async fn track_external_history_drag(
++  window: tauri::Window,
++  history_id: String,
++) -> Result<bool, String> {
++  #[cfg(not(target_os = "windows"))]
++  {
++    let _ = (window, history_id);
++    Ok(true)
++  }
++
++  #[cfg(target_os = "windows")]
++  {
++    use std::os::windows::ffi::OsStrExt;
++    use std::path::Path;
++    use std::sync::Arc;
++
++    let handle = window.hwnd().map_err(|error| error.to_string())?.0 as usize;
++    tauri::async_runtime::spawn_blocking(move || {
++      let mut payload = Vec::new();
++      let mut is_file = false;
++      if let Some(item) = crate::services::history_service::get_clipboard_history_by_id(&history_id)
++      {
++        if item.is_image.unwrap_or(false) && !item.is_link.unwrap_or(false) {
++          if let Some(path) = item.image_path_full_res {
++            let path = crate::db::to_absolute_image_path(&path);
++            if Path::new(&path).is_file() {
++              payload.extend(Path::new(&path).as_os_str().encode_wide());
++              is_file = true;
++            }
++          }
++        } else if let Some(value) = item.value {
++          payload.extend(value.encode_utf16());
++        }
++      }
++      payload.push(0);
++      let payload = Arc::new(payload);
++      loop {
++        let destination = unsafe { wait_for_drag_exit(handle, i32::from(payload.len() > 1)) };
++        if destination != 2 {
++          return Ok(destination == 1);
++        }
++
++        // The foreground window's thread must start OLE's mouse capture.
++        // Wait on this worker so that in-app dragging can still process events.
++        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
++        let drag_payload = Arc::clone(&payload);
++        window
++          .run_on_main_thread(move || {
++            let result =
++              unsafe { drag_history_payload(handle, drag_payload.as_ptr(), i32::from(is_file)) };
++            let _ = sender.send(result);
++          })
++          .map_err(|error| error.to_string())?;
++        let result = receiver.recv().map_err(|error| error.to_string())?;
++        if result != 2 {
++          return Ok(result == 1);
++        }
++      }
++    })
++    .await
++    .map_err(|error| error.to_string())?
++  }
++}
+diff --git a/src-tauri/src/history_drag_windows.cpp b/src-tauri/src/history_drag_windows.cpp
+new file mode 100644
+index 0000000..977e709
+--- /dev/null
++++ b/src-tauri/src/history_drag_windows.cpp
+@@ -0,0 +1,171 @@
++#define WIN32_LEAN_AND_MEAN
++#include <windows.h>
++#include <ole2.h>
++#include <shellapi.h>
++#include <shlobj.h>
++#include <cstdint>
++#include <cstring>
++#include <string>
++
++namespace {
++bool cursor_is_in_window(HWND window) {
++  POINT cursor{};
++  return GetCursorPos(&cursor) &&
++         GetAncestor(WindowFromPoint(cursor), GA_ROOT) == window;
++}
++
++bool left_button_is_down() {
++  return (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
++}
++
++class HistoryDragData final : public IDataObject {
++public:
++  HistoryDragData(const wchar_t* value, bool file)
++      : value_(value), format_(file ? CF_HDROP : CF_UNICODETEXT) {}
++
++  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID id, void** result) override {
++    if (!result) return E_POINTER;
++    *result = nullptr;
++    if (id != IID_IUnknown && id != IID_IDataObject) return E_NOINTERFACE;
++    *result = static_cast<IDataObject*>(this);
++    AddRef();
++    return S_OK;
++  }
++
++  ULONG STDMETHODCALLTYPE AddRef() override { return ++references_; }
++  ULONG STDMETHODCALLTYPE Release() override {
++    const ULONG count = --references_;
++    if (count == 0) delete this;
++    return count;
++  }
++
++  HRESULT STDMETHODCALLTYPE GetData(FORMATETC* request, STGMEDIUM* medium) override {
++    if (!medium) return E_POINTER;
++    const HRESULT result = QueryGetData(request);
++    if (FAILED(result)) return result;
++
++    const bool file = format_ == CF_HDROP;
++    const size_t bytes = (value_.size() + 1) * sizeof(wchar_t);
++    const size_t offset = file ? sizeof(DROPFILES) : 0;
++    HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT,
++                                 offset + bytes + (file ? sizeof(wchar_t) : 0));
++    if (!memory) return E_OUTOFMEMORY;
++    auto* buffer = static_cast<unsigned char*>(GlobalLock(memory));
++    if (!buffer) {
++      GlobalFree(memory);
++      return E_OUTOFMEMORY;
++    }
++    if (file) {
++      auto* header = reinterpret_cast<DROPFILES*>(buffer);
++      header->pFiles = sizeof(DROPFILES);
++      header->fWide = TRUE;
++    }
++    std::memcpy(buffer + offset, value_.c_str(), bytes);
++    GlobalUnlock(memory);
++    *medium = {};
++    medium->tymed = TYMED_HGLOBAL;
++    medium->hGlobal = memory;
++    return S_OK;
++  }
++
++  HRESULT STDMETHODCALLTYPE QueryGetData(FORMATETC* request) override {
++    if (!request) return E_POINTER;
++    if (request->cfFormat != format_) return DV_E_FORMATETC;
++    if (request->dwAspect != DVASPECT_CONTENT) return DV_E_DVASPECT;
++    if (request->lindex != -1) return DV_E_LINDEX;
++    if (!(request->tymed & TYMED_HGLOBAL)) return DV_E_TYMED;
++    return S_OK;
++  }
++
++  HRESULT STDMETHODCALLTYPE EnumFormatEtc(DWORD direction, IEnumFORMATETC** formats) override {
++    if (direction != DATADIR_GET) return E_NOTIMPL;
++    FORMATETC format{format_, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
++    return SHCreateStdEnumFmtEtc(1, &format, formats);
++  }
++
++  HRESULT STDMETHODCALLTYPE GetDataHere(FORMATETC*, STGMEDIUM*) override { return E_NOTIMPL; }
++  HRESULT STDMETHODCALLTYPE GetCanonicalFormatEtc(FORMATETC*, FORMATETC* output) override {
++    if (output) output->ptd = nullptr;
++    return E_NOTIMPL;
++  }
++  HRESULT STDMETHODCALLTYPE SetData(FORMATETC*, STGMEDIUM*, BOOL) override { return E_NOTIMPL; }
++  HRESULT STDMETHODCALLTYPE DAdvise(FORMATETC*, DWORD, IAdviseSink*, DWORD*) override {
++    return OLE_E_ADVISENOTSUPPORTED;
++  }
++  HRESULT STDMETHODCALLTYPE DUnadvise(DWORD) override { return OLE_E_ADVISENOTSUPPORTED; }
++  HRESULT STDMETHODCALLTYPE EnumDAdvise(IEnumSTATDATA**) override { return OLE_E_ADVISENOTSUPPORTED; }
++
++private:
++  ULONG references_ = 1;
++  std::wstring value_;
++  CLIPFORMAT format_;
++};
++
++class HistoryDragSource final : public IDropSource {
++public:
++  explicit HistoryDragSource(HWND window) : window_(window) {}
++
++  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID id, void** result) override {
++    if (!result) return E_POINTER;
++    *result = nullptr;
++    if (id != IID_IUnknown && id != IID_IDropSource) return E_NOINTERFACE;
++    *result = static_cast<IDropSource*>(this);
++    AddRef();
++    return S_OK;
++  }
++
++  ULONG STDMETHODCALLTYPE AddRef() override { return ++references_; }
++  ULONG STDMETHODCALLTYPE Release() override {
++    const ULONG count = --references_;
++    if (count == 0) delete this;
++    return count;
++  }
++
++  HRESULT STDMETHODCALLTYPE QueryContinueDrag(BOOL escape, DWORD keys) override {
++    if (escape || !IsWindow(window_)) return DRAGDROP_S_CANCEL;
++    returned = cursor_is_in_window(window_);
++    if (returned) return DRAGDROP_S_CANCEL;
++    return (keys & MK_LBUTTON) ? S_OK : DRAGDROP_S_DROP;
++  }
++
++  HRESULT STDMETHODCALLTYPE GiveFeedback(DWORD) override { return DRAGDROP_S_USEDEFAULTCURSORS; }
++
++  bool returned = false;
++
++private:
++  ULONG references_ = 1;
++  HWND window_;
++};
++} // namespace
++
++// Return 1 for an in-window release and 2 for a pending boundary crossing.
++extern "C" int wait_for_drag_exit(std::uintptr_t handle, int has_payload) {
++  HWND window = reinterpret_cast<HWND>(handle);
++  while (IsWindow(window)) {
++    if (GetAsyncKeyState(VK_ESCAPE) & 0x8000) return 0;
++    if (!left_button_is_down()) return cursor_is_in_window(window);
++    if (has_payload && !cursor_is_in_window(window)) return 2;
++    Sleep(10);
++  }
++  return 0;
++}
++
++extern "C" int drag_history_payload(std::uintptr_t handle, const wchar_t* payload, int is_file) {
++  HWND window = reinterpret_cast<HWND>(handle);
++  if (!IsWindow(window)) return 0;
++  if (!left_button_is_down()) return cursor_is_in_window(window);
++  if (cursor_is_in_window(window)) return 2;
++
++  const HRESULT ole = OleInitialize(nullptr);
++  if (FAILED(ole)) return 0;
++  auto* data = new HistoryDragData(payload, is_file != 0);
++  auto* source = new HistoryDragSource(window);
++  DWORD effect = DROPEFFECT_NONE;
++  const HRESULT result = DoDragDrop(data, source, DROPEFFECT_COPY, &effect);
++  const bool returned = source->returned;
++  data->Release();
++  source->Release();
++  OleUninitialize();
++  // A return to PasteBar hands the same press back to the in-window drag.
++  return result == DRAGDROP_S_CANCEL && returned ? 2 : 0;
++}
+diff --git a/src-tauri/tests/history_drag_windows.cpp b/src-tauri/tests/history_drag_windows.cpp
+new file mode 100644
+index 0000000..ce27cca
+--- /dev/null
++++ b/src-tauri/tests/history_drag_windows.cpp
+@@ -0,0 +1,41 @@
++#include "../src/history_drag_windows.cpp"
++#include <cassert>
++#include <iostream>
++
++int main() {
++  const HRESULT initialized = OleInitialize(nullptr);
++  assert(SUCCEEDED(initialized));
++
++  const std::wstring expected_text = L"Clipboard test \u526a\u8d34\u677f\r\nSecond line";
++  auto* text = new HistoryDragData(expected_text.c_str(), false);
++  FORMATETC text_format{CF_UNICODETEXT, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
++  STGMEDIUM text_data{};
++  assert(text->GetData(&text_format, &text_data) == S_OK);
++  const auto* stored_text = static_cast<const wchar_t*>(GlobalLock(text_data.hGlobal));
++  assert(expected_text == stored_text);
++  GlobalUnlock(text_data.hGlobal);
++  ReleaseStgMedium(&text_data);
++  text->Release();
++
++  const std::wstring expected_file = L"D:\\clipboard test\\\u56fe\u7247.png";
++  auto* file = new HistoryDragData(expected_file.c_str(), true);
++  assert(file->QueryGetData(&text_format) == DV_E_FORMATETC);
++  IEnumFORMATETC* formats = nullptr;
++  assert(file->EnumFormatEtc(DATADIR_GET, &formats) == S_OK);
++  FORMATETC file_format{};
++  assert(formats->Next(1, &file_format, nullptr) == S_OK);
++  assert(file_format.cfFormat == CF_HDROP);
++  formats->Release();
++  STGMEDIUM file_data{};
++  assert(file->GetData(&file_format, &file_data) == S_OK);
++  HDROP drop = static_cast<HDROP>(file_data.hGlobal);
++  assert(DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0) == 1);
++  wchar_t file_name[MAX_PATH]{};
++  DragQueryFileW(drop, 0, file_name, MAX_PATH);
++  assert(expected_file == file_name);
++  ReleaseStgMedium(&file_data);
++  file->Release();
++
++  OleUninitialize();
++  std::cout << "Windows received the Unicode text and one PNG file path.\n";
++}
