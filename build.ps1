@@ -16,7 +16,7 @@ $env:TMP = $env:TEMP
 
 New-Item -ItemType Directory -Path $buildRoot,$env:TEMP -Force | Out-Null
 if (-not (Test-Path -LiteralPath $source)) {
-    git -c core.longpaths=true clone --branch v0.7.0 --depth 1 https://github.com/PasteBar/PasteBarApp.git $source
+    git clone --config core.longpaths=true --config core.autocrlf=false --branch v0.7.0 --depth 1 https://github.com/PasteBar/PasteBarApp.git $source
     if ($LASTEXITCODE) { throw 'Could not download the PasteBar v0.7.0 source.' }
 }
 
@@ -25,8 +25,10 @@ if ($LASTEXITCODE -or $actualCommit -ne $sourceCommit) {
     throw 'The checkout does not match the tested PasteBar v0.7.0 commit.'
 }
 
-git -C $source apply --reverse --check $patch 2>$null
-if ($LASTEXITCODE) {
+if (Test-Path -LiteralPath (Join-Path $source 'src-tauri/src/history_drag.rs')) {
+    git -C $source apply --reverse --check $patch
+    if ($LASTEXITCODE) { throw 'The existing checkout does not contain the expected changes.' }
+} else {
     git -C $source apply --check $patch
     if ($LASTEXITCODE) { throw 'The change does not apply cleanly to this checkout.' }
     git -C $source apply $patch

@@ -14,7 +14,7 @@
 
 需要 Git、Node.js 22、通过 rustup 安装的 Rust 1.87.0 MSVC 工具链、Visual Studio 2022 的 C++ 桌面开发组件和 Windows SDK。运行时需要 Microsoft Edge WebView2。
 
-在 Visual Studio 的 x64 开发者 PowerShell 中，进入本仓库后运行：
+进入本仓库，在 Visual Studio 的 x64 开发者 PowerShell 中运行下面的命令。
 
 ```powershell
 .\build.ps1
